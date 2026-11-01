@@ -1,0 +1,18 @@
+# Xcode & macOS
+.DS_Store
+*/.DS_Store
+build/
+DerivedData/
+*.moved-aside
+*.xcuserstate
+xcuserdata/
+*.xcscmblueprint
+
+# Swift Package Manager
+.build/
+Packages/
+
+# Backup & logs
+*.log
+*.tmp
+crashlytics-build.properties

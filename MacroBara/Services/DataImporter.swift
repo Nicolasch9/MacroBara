@@ -1,0 +1,1279 @@
+//
+//  DataImporter.swift
+//  MacroBara
+//
+
+import Foundation
+import SwiftData
+
+final class DataImporter {
+    static let shared = DataImporter()
+    
+    func consolidateAndDeduplicate(modelContext: ModelContext) {
+        let logDescriptor = FetchDescriptor<DailyLog>()
+        guard let allLogs = try? modelContext.fetch(logDescriptor), !allLogs.isEmpty else { return }
+        
+        var logsByDate: [String: [DailyLog]] = [:]
+        for log in allLogs {
+            logsByDate[log.dateString, default: []].append(log)
+        }
+        
+        var didModify = false
+        for (_, group) in logsByDate {
+            if group.count > 1 {
+                didModify = true
+                // Scegli il log canonico: quello con più pasti o calorie attive
+                let canonical = group.max(by: {
+                    if $0.meals.count != $1.meals.count {
+                        return $0.meals.count < $1.meals.count
+                    }
+                    return $0.activeKcal < $1.activeKcal
+                }) ?? group[0]
+                
+                for duplicate in group where duplicate.id != canonical.id {
+                    for meal in duplicate.meals {
+                        if !canonical.meals.contains(where: { $0.title == meal.title && $0.kcal == meal.kcal }) {
+                            meal.dailyLog = canonical
+                            canonical.meals.append(meal)
+                        } else {
+                            modelContext.delete(meal)
+                        }
+                    }
+                    canonical.steps = max(canonical.steps, duplicate.steps)
+                    canonical.activeKcal = max(canonical.activeKcal, duplicate.activeKcal)
+                    if canonical.restingKcal == 0 { canonical.restingKcal = duplicate.restingKcal }
+                    if canonical.waterL == 0 { canonical.waterL = duplicate.waterL }
+                    if canonical.dailyNotes.isEmpty { canonical.dailyNotes = duplicate.dailyNotes }
+                    
+                    modelContext.delete(duplicate)
+                }
+            }
+        }
+        
+        // Sanifica e assicura che il metabolismo basale (BMR) sia sempre valido (minimo 1750 kcal)
+        for l in allLogs {
+            if l.restingKcal < 1750.0 {
+                l.restingKcal = 1750.0
+                didModify = true
+            }
+        }
+        
+        if didModify {
+            try? modelContext.save()
+            print("✅ Consolidamento duplicati completato: memoria SwiftData unificata con successo!")
+        }
+    }
+    
+    func importHistoryIfNeeded(modelContext: ModelContext, force: Bool = false) {
+        consolidateAndDeduplicate(modelContext: modelContext)
+        
+        let logDescriptor = FetchDescriptor<DailyLog>()
+        let logsCount = (try? modelContext.fetchCount(logDescriptor)) ?? 0
+        
+        let weighDescriptor = FetchDescriptor<WeighIn>()
+        let weighCount = (try? modelContext.fetchCount(weighDescriptor)) ?? 0
+        
+        // Se force == false e ci sono già dati salvati, non sovrascrivere la memoria dell'utente!
+        if !force && logsCount >= 7 && weighCount >= 1 {
+            return
+        }
+        
+        cleanupAndImport(modelContext: modelContext, customData: nil)
+    }
+    
+    func cleanupAndImport(modelContext: ModelContext, customData: Data? = nil) {
+        do {
+            let data: Data
+            if let customData = customData {
+                data = customData
+            } else if let url = Bundle.main.url(forResource: "initial_history", withExtension: "json"),
+                      let fileData = try? Data(contentsOf: url) {
+                data = fileData
+            } else {
+                data = Data(DataImporter.embeddedHistoryJSON.utf8)
+            }
+            
+            guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
+            
+            // 1. Profilo
+            if let profileDict = json["profile"] as? [String: Any] {
+                let profileDescriptor = FetchDescriptor<UserProfile>()
+                if let existingProfiles = try? modelContext.fetch(profileDescriptor), let p = existingProfiles.first {
+                    p.currentWeightKg = (profileDict["current_weight_kg"] as? Double) ?? p.currentWeightKg
+                    p.targetWeightKg = (profileDict["target_weight_kg"] as? Double) ?? p.targetWeightKg
+                    p.normopesoMaxWeightKg = (profileDict["normopeso_max_weight_kg"] as? Double) ?? p.normopesoMaxWeightKg
+                    p.startWeightKg = (profileDict["start_weight_kg"] as? Double) ?? 89.0
+                    p.bmrKcal = (profileDict["bmr"] as? Double) ?? p.bmrKcal
+                    p.defaultTdeeKcal = (profileDict["tdee_kcal"] as? Double) ?? p.defaultTdeeKcal
+                    p.targetKcal = (profileDict["target_calories"] as? Double) ?? p.targetKcal
+                }
+            }
+            
+            // 2. DEDUP & AGGIORNAMENTO PESATE SETTIMANALI
+            let weighInDescriptor = FetchDescriptor<WeighIn>()
+            let existingWeighIns = (try? modelContext.fetch(weighInDescriptor)) ?? []
+            for w in existingWeighIns {
+                modelContext.delete(w)
+            }
+            
+            if let weighInsArray = json["weigh_ins"] as? [[String: Any]] {
+                var insertedWeeks = Set<Int>()
+                for item in weighInsArray {
+                    let week = (item["week_number"] as? Int) ?? 0
+                    if !insertedWeeks.contains(week) {
+                        insertedWeeks.insert(week)
+                        let dateStr = (item["date"] as? String) ?? ""
+                        let date = DailyLog.dateFormatter.date(from: dateStr) ?? Date()
+                        let weight = (item["weight_kg"] as? Double) ?? 89.0
+                        let deltaPrev = (item["delta_prev_kg"] as? Double) ?? 0.0
+                        let deltaTotal = (item["delta_total_kg"] as? Double) ?? 0.0
+                        let notes = (item["notes"] as? String) ?? ""
+                        
+                        let w = WeighIn(
+                            weekNumber: week,
+                            date: date,
+                            weightKg: weight,
+                            deltaPrevKg: deltaPrev,
+                            deltaTotalKg: deltaTotal,
+                            notes: notes
+                        )
+                        modelContext.insert(w)
+                    }
+                }
+            }
+            
+            // 3. DEDUP & IMPORTAZIONE GIORNI E PASTI REALI
+            let logDescriptor = FetchDescriptor<DailyLog>()
+            let existingLogs = (try? modelContext.fetch(logDescriptor)) ?? []
+            var logByDate: [String: DailyLog] = [:]
+            
+            for l in existingLogs {
+                if let existing = logByDate[l.dateString] {
+                    // Se abbiamo un duplicato, eliminiamo il duplicato vuoto
+                    if existing.meals.isEmpty && !l.meals.isEmpty {
+                        modelContext.delete(existing)
+                        logByDate[l.dateString] = l
+                    } else {
+                        modelContext.delete(l)
+                    }
+                } else {
+                    logByDate[l.dateString] = l
+                }
+            }
+            
+            if let daysDict = json["days"] as? [String: [String: Any]] {
+                for (dateStr, dayData) in daysDict {
+                    let date = DailyLog.dateFormatter.date(from: dateStr) ?? Date()
+                    let weekday = (dayData["weekday"] as? String) ?? ""
+                    let dailyNotes = (dayData["daily_notes"] as? String) ?? ""
+                    let steps = (dayData["steps"] as? Int) ?? 0
+                    var activeKcal = (dayData["active_kcal"] as? Double) ?? 0.0
+                    let restingKcal = (dayData["resting_kcal"] as? Double) ?? 1750.0
+                    let realTdee = (dayData["real_tdee"] as? Double) ?? 0.0
+                    let waterL = (dayData["total_water_l"] as? Double) ?? 0.0
+                    
+                    if activeKcal == 0 && realTdee > restingKcal {
+                        activeKcal = realTdee - restingKcal
+                    } else if activeKcal == 0 && realTdee == 0 {
+                        activeKcal = 400.0
+                    }
+                    
+                    let log: DailyLog
+                    if let existingLog = logByDate[dateStr] {
+                        log = existingLog
+                        log.date = date
+                        log.weekday = weekday
+                        log.dailyNotes = dailyNotes
+                        if steps > 0 || log.steps == 0 { log.steps = steps }
+                        if activeKcal > 0 || log.activeKcal == 0 { log.activeKcal = activeKcal }
+                        if restingKcal > 0 || log.restingKcal == 0 { log.restingKcal = restingKcal }
+                        if waterL > 0 || log.waterL == 0 { log.waterL = waterL }
+                        
+                        // Rimuovi pasti vecchi duplicati
+                        for oldMeal in log.meals {
+                            modelContext.delete(oldMeal)
+                        }
+                        log.meals.removeAll()
+                    } else {
+                        log = DailyLog(
+                            date: date,
+                            dateString: dateStr,
+                            weekday: weekday,
+                            dailyNotes: dailyNotes,
+                            steps: steps,
+                            activeKcal: activeKcal,
+                            restingKcal: restingKcal,
+                            waterL: waterL
+                        )
+                        modelContext.insert(log)
+                        logByDate[dateStr] = log
+                    }
+                    
+                    if let mealsArray = dayData["meals"] as? [[String: Any]] {
+                        for (index, mealDict) in mealsArray.enumerated() {
+                            let typeRaw = (mealDict["type"] as? String) ?? "Colazione"
+                            let mealType = MealType(rawValue: typeRaw) ?? (typeRaw.lowercased().contains("spuntino") ? .spuntino : .colazione)
+                            let desc = (mealDict["description"] as? String) ?? ""
+                            let kcal = (mealDict["kcal"] as? Double) ?? 0.0
+                            let protein = (mealDict["protein_g"] as? Double) ?? 0.0
+                            let carbs = (mealDict["carbs_g"] as? Double) ?? 0.0
+                            let fat = (mealDict["fat_g"] as? Double) ?? 0.0
+                            let sugars = (mealDict["sugars_g"] as? Double) ?? 0.0
+                            let notes = (mealDict["notes"] as? String) ?? ""
+                            let water = (mealDict["water_l"] as? Double) ?? 0.0
+                            
+                            // Assegna orario fisiologico in base all'ordine e al tipo di pasto
+                            let mealHour: Int
+                            let mealMinute: Int
+                            let lower = typeRaw.lowercased()
+                            if lower.contains("colazione") {
+                                mealHour = 8; mealMinute = 0
+                            } else if lower.contains("pranzo") {
+                                mealHour = 13; mealMinute = 0
+                            } else if lower.contains("cena") {
+                                mealHour = 20; mealMinute = 30
+                            } else if lower.contains("spuntino") || lower.contains("snack") {
+                                let hasPranzoBefore = mealsArray.prefix(index).contains(where: { (($0["type"] as? String) ?? "").lowercased().contains("pranzo") })
+                                let hasCenaBefore = mealsArray.prefix(index).contains(where: { (($0["type"] as? String) ?? "").lowercased().contains("cena") })
+                                if !hasPranzoBefore {
+                                    mealHour = 10; mealMinute = 30 // Spuntino Mattina
+                                } else if hasCenaBefore {
+                                    mealHour = 22; mealMinute = 0 // Spuntino Sera
+                                } else {
+                                    mealHour = 17; mealMinute = 0 // Spuntino Pomeriggio
+                                }
+                            } else {
+                                mealHour = 12; mealMinute = index * 10
+                            }
+                            
+                            let mealDate = Calendar.current.date(bySettingHour: mealHour, minute: mealMinute, second: 0, of: date) ?? date
+                            
+                            let entry = MealEntry(
+                                date: mealDate,
+                                mealType: mealType,
+                                mealTypeRaw: typeRaw,
+                                title: typeRaw,
+                                foodDescription: desc,
+                                kcal: kcal,
+                                proteinG: protein,
+                                carbsG: carbs,
+                                fatG: fat,
+                                sugarsG: sugars,
+                                waterL: water,
+                                notes: notes
+                            )
+                            entry.dailyLog = log
+                            log.meals.append(entry)
+                            modelContext.insert(entry)
+                        }
+                    }
+                }
+            }
+            
+            try? modelContext.save()
+            print("✅ Deduplicazione e importazione completata con successo!")
+        } catch {
+            print("Errore cleanupAndImport: \(error.localizedDescription)")
+        }
+    }
+    
+    static let embeddedHistoryJSON: String = #"""
+{
+  "profile": {
+    "name": "Marco Rossi",
+    "age": 25,
+    "occupation": "Software Engineer & Fitness Enthusiast",
+    "height_cm": 180,
+    "start_weight_kg": 89.0,
+    "current_weight_kg": 87.9,
+    "target_weight_kg": 78.0,
+    "normopeso_max_weight_kg": 80.7,
+    "weight_to_normopeso_kg": 7.2,
+    "tdee_kcal": 2150.0,
+    "target_kcal_min": 1500,
+    "target_kcal_max": 1700,
+    "target_kcal_avg": 1600,
+    "target_deficit_daily_kcal": 550,
+    "target_protein_g": 130,
+    "target_carbs_g": 170,
+    "target_fat_g": 50,
+    "target_sugar_max_g": 40,
+    "target_water_l": 2.5,
+    "start_date": "2026-10-19",
+    "prev_week_sugary_drinks": 10,
+    "bmr": 1750.0,
+    "target_calories": 1600
+  },
+  "meal_presets": {
+    "porridge": {
+      "name": "Porridge Marco (Colazione Standard)",
+      "type": "Colazione",
+      "description": "Ciotola di porridge (40g avena, 20g whey, 10g chia, 150ml latte mandorla zero, 5g anacardi, 15g fondente 70%)",
+      "kcal": 410.0,
+      "protein_g": 25.0,
+      "carbs_g": 36.0,
+      "fat_g": 17.0,
+      "sugars_g": 6.0,
+      "water_l": 0.2,
+      "notes": "Preset salvato per colazione abituale"
+    },
+    "porridge_yogurt": {
+      "name": "Porridge Yogurt Marco (Preset 2)",
+      "type": "Colazione",
+      "description": "Porridge 2 con yogurt (20g avena, 10g whey cioccolato, 5g chia, 15g fondente 70%, 5g anacardi, yogurt greco magro)",
+      "kcal": 296.0,
+      "protein_g": 21.0,
+      "carbs_g": 21.3,
+      "fat_g": 13.3,
+      "sugars_g": 5.0,
+      "water_l": 0.2,
+      "notes": "Preset 2: Porridge con yogurt greco magro e dosi ridotte di avena/whey (20g avena, 10g whey, 5g chia, 15g fondente 70%, 5g anacardi)"
+    }
+  },
+  "weigh_ins": [
+    {
+      "week_number": 0,
+      "date": "2026-10-19",
+      "weight_kg": 89.0,
+      "delta_prev_kg": 0.0,
+      "delta_total_kg": 0.0,
+      "avg_kcal": null,
+      "notes": "Peso di partenza calibrato Lunedì 19/10"
+    },
+    {
+      "week_number": 1,
+      "date": "2026-10-25",
+      "weight_kg": 88.8,
+      "delta_prev_kg": -0.2,
+      "delta_total_kg": -0.2,
+      "avg_kcal": 2066.7,
+      "notes": "Fine Settimana 1 - Peso a digiuno"
+    },
+    {
+      "week_number": 2,
+      "date": "2026-11-01",
+      "weight_kg": 87.9,
+      "delta_prev_kg": -0.9,
+      "delta_total_kg": -1.1,
+      "avg_kcal": 1609.3,
+      "notes": "Fine Settimana 2 - Pesata Domenicale a digiuno"
+    }
+  ],
+  "days": {
+    "2026-10-21": {
+      "date": "2026-10-21",
+      "weekday": "Mercoledì",
+      "meals": [
+        {
+          "id": 1,
+          "type": "Colazione",
+          "description": "Ciotola di porridge (40g avena, 20g whey, 10g chia, 150ml latte mandorla zero, 5g anacardi, 15g fondente 70%)",
+          "kcal": 410.0,
+          "protein_g": 25.0,
+          "carbs_g": 36.0,
+          "fat_g": 17.0,
+          "sugars_g": 6.0,
+          "water_l": 0.2,
+          "notes": "Preset Colazione"
+        },
+        {
+          "id": 2,
+          "type": "Pranzo",
+          "description": "Panino smozzicato (50g crudo, ~75g stracciatella, 1-2 taralli sbriciolati)",
+          "kcal": 780.0,
+          "protein_g": 34.0,
+          "carbs_g": 75.0,
+          "fat_g": 34.0,
+          "sugars_g": 5.0,
+          "water_l": 0.4,
+          "notes": "Zuccheri: ~5g"
+        },
+        {
+          "id": 3,
+          "type": "Cena",
+          "description": "2 hamburger di bovino (~250-300g) + patate al forno (~200g) con olio",
+          "kcal": 850.0,
+          "protein_g": 50.0,
+          "carbs_g": 35.0,
+          "fat_g": 55.0,
+          "sugars_g": 3.0,
+          "water_l": 0.4,
+          "notes": "Zuccheri: ~3g"
+        },
+        {
+          "id": 4,
+          "type": "Bevande",
+          "description": "FuzeTea pesca (330ml), succo pera (200ml), Red Bull pesca (250ml), bicchiere di spuma (200ml), acqua",
+          "kcal": 370.0,
+          "protein_g": 0.0,
+          "carbs_g": 88.0,
+          "fat_g": 0.0,
+          "sugars_g": 88.0,
+          "water_l": 1.0,
+          "notes": "Zuccheri semplici liquidi: ~88g"
+        }
+      ],
+      "total_kcal": 2410.0,
+      "total_protein": 109.0,
+      "total_carbs": 234.0,
+      "total_fat": 106.0,
+      "total_sugars": 102.0,
+      "total_water_l": 2.0,
+      "daily_notes": "Primo giorno - rilevato eccesso zuccheri da bevande",
+      "steps": 3365,
+      "active_kcal": 417.0,
+      "real_tdee": 2167.0,
+      "device": "iPhone + Apple Watch",
+      "resting_kcal": 1750.0
+    },
+    "2026-10-20": {
+      "date": "2026-10-20",
+      "weekday": "Martedì",
+      "meals": [
+        {
+          "id": 1,
+          "type": "Colazione",
+          "description": "Ciotola di porridge (40g avena, 20g whey, 10g chia, 150ml latte mandorla zero, 5g anacardi, 15g fondente 70%)",
+          "kcal": 410.0,
+          "protein_g": 25.0,
+          "carbs_g": 36.0,
+          "fat_g": 17.0,
+          "sugars_g": 6.0,
+          "water_l": 0.2,
+          "notes": "Preset Porridge (Colazione Abituale)"
+        },
+        {
+          "id": 2,
+          "type": "Pranzo",
+          "description": "Panino senza mollica (~60g crosta) con petto di pollo (~125g), pomodoro, lattuga e filo d'olio",
+          "kcal": 365.0,
+          "protein_g": 34.0,
+          "carbs_g": 36.0,
+          "fat_g": 9.0,
+          "sugars_g": 3.0,
+          "water_l": 0.4,
+          "notes": ""
+        },
+        {
+          "id": 3,
+          "type": "Cena",
+          "description": "Fetta di rollò di carne con spinaci e formaggio (~190g) + mezzo panino (~50g)",
+          "kcal": 535.0,
+          "protein_g": 34.0,
+          "carbs_g": 33.0,
+          "fat_g": 29.0,
+          "sugars_g": 2.0,
+          "water_l": 0.4,
+          "notes": ""
+        },
+        {
+          "id": 4,
+          "type": "Bevande",
+          "description": "FuzeTea pesca (330ml), 2 bicchieri di spuma (400ml), tanta acqua",
+          "kcal": 215.0,
+          "protein_g": 0.0,
+          "carbs_g": 50.0,
+          "fat_g": 0.0,
+          "sugars_g": 50.0,
+          "water_l": 1.5,
+          "notes": "Zuccheri semplici liquidi: ~50g"
+        }
+      ],
+      "total_kcal": 1525.0,
+      "total_protein": 93.0,
+      "total_carbs": 155.0,
+      "total_fat": 55.0,
+      "total_sugars": 61.0,
+      "total_water_l": 2.5,
+      "daily_notes": "",
+      "steps": 4970,
+      "active_kcal": 417.5,
+      "real_tdee": 2167.5,
+      "device": "Apple Watch",
+      "resting_kcal": 1750.0
+    },
+    "2026-10-19": {
+      "date": "2026-10-19",
+      "weekday": "Lunedì",
+      "meals": [
+        {
+          "id": 1,
+          "type": "Colazione",
+          "description": "Cornetto da bar con crema alle nocciole (~85 g)",
+          "kcal": 390.0,
+          "protein_g": 6.5,
+          "carbs_g": 46.0,
+          "fat_g": 19.5,
+          "sugars_g": 22.0,
+          "water_l": 0.2,
+          "notes": "Zuccheri: ~22g"
+        },
+        {
+          "id": 2,
+          "type": "Pranzo",
+          "description": "Panino Pino Daniele di Donato (pane, crudo al vino ~80g, stracciata ~130g, tarallo intero sbriciolato)",
+          "kcal": 1050.0,
+          "protein_g": 53.0,
+          "carbs_g": 104.0,
+          "fat_g": 50.0,
+          "sugars_g": 6.0,
+          "water_l": 0.5,
+          "notes": "Zuccheri: ~6g"
+        },
+        {
+          "id": 3,
+          "type": "Cena",
+          "description": "2 hamburger di bovino (~250-300g) + patate al forno (~200g) con olio",
+          "kcal": 850.0,
+          "protein_g": 50.0,
+          "carbs_g": 35.0,
+          "fat_g": 55.0,
+          "sugars_g": 3.0,
+          "water_l": 0.4,
+          "notes": "Zuccheri: ~3g"
+        },
+        {
+          "id": 4,
+          "type": "Bevande",
+          "description": "Red Bull (250 ml), lattina di Coca-Cola classica (330 ml), tanta acqua",
+          "kcal": 254.0,
+          "protein_g": 0.0,
+          "carbs_g": 62.0,
+          "fat_g": 0.0,
+          "sugars_g": 62.0,
+          "water_l": 1.5,
+          "notes": "Zuccheri semplici liquidi: ~62g"
+        }
+      ],
+      "total_kcal": 2544.0,
+      "total_protein": 109.5,
+      "total_carbs": 247.0,
+      "total_fat": 124.5,
+      "total_sugars": 93.0,
+      "total_water_l": 2.6,
+      "daily_notes": "",
+      "steps": 4055,
+      "active_kcal": 162.0,
+      "real_tdee": 1912.0,
+      "device": "iPhone",
+      "resting_kcal": 1750.0
+    },
+    "2026-10-22": {
+      "date": "2026-10-22",
+      "weekday": "Giovedì",
+      "meals": [
+        {
+          "id": 1,
+          "type": "Colazione",
+          "description": "Ciotola di porridge (40g avena, 20g whey, 10g chia, 150ml latte mandorla zero, 5g anacardi, 15g fondente 70%)",
+          "kcal": 410.0,
+          "protein_g": 25.0,
+          "carbs_g": 36.0,
+          "fat_g": 17.0,
+          "sugars_g": 6.0,
+          "water_l": 0.2,
+          "notes": "Preset salvato per colazione abituale"
+        },
+        {
+          "id": 2,
+          "type": "Pranzo",
+          "description": "Panino senza mollica (~60-70g crosta) con 5 fette di bresaola (~50g) e filo d'olio",
+          "kcal": 310.0,
+          "protein_g": 21.5,
+          "carbs_g": 37.0,
+          "fat_g": 7.5,
+          "sugars_g": 1.0,
+          "water_l": 0.0,
+          "notes": "Panino senza mollica con bresaola e filo d'olio"
+        },
+        {
+          "id": 3,
+          "type": "Cena",
+          "description": "Pasta con zucchine e gamberetti (~95g pasta, ~140g gamberetti, ~180g zucchine, 1 cucchiaio olio EVO)",
+          "kcal": 600.0,
+          "protein_g": 39.0,
+          "carbs_g": 74.0,
+          "fat_g": 15.0,
+          "sugars_g": 5.0,
+          "water_l": 0.0,
+          "notes": "Pasta zucchine e gamberetti con olio EVO"
+        },
+        {
+          "id": 4,
+          "type": "Bevande",
+          "description": "Red Bull White Edition cocco-açaí (lattina 250ml) + tanta acqua",
+          "kcal": 113.0,
+          "protein_g": 0.0,
+          "carbs_g": 27.0,
+          "fat_g": 0.0,
+          "sugars_g": 27.0,
+          "water_l": 1.5,
+          "notes": "Red Bull White Edition (250ml) + idratazione abbondante"
+        }
+      ],
+      "total_kcal": 1433.0,
+      "total_protein": 85.5,
+      "total_carbs": 174.0,
+      "total_fat": 39.5,
+      "total_sugars": 39.0,
+      "total_water_l": 1.7,
+      "daily_notes": "",
+      "steps": 6669,
+      "active_kcal": 590.0,
+      "resting_kcal": 1750.0,
+      "real_tdee": 2340.0
+    },
+    "2026-10-23": {
+      "date": "2026-10-23",
+      "weekday": "Venerdì",
+      "meals": [
+        {
+          "id": 1,
+          "type": "Colazione",
+          "description": "Ciotola di porridge (40g avena, 20g whey, 10g chia, 150ml latte mandorla zero, 5g anacardi, 15g fondente 70%)",
+          "kcal": 410.0,
+          "protein_g": 25.0,
+          "carbs_g": 36.0,
+          "fat_g": 17.0,
+          "sugars_g": 6.0,
+          "water_l": 0.2,
+          "notes": "Preset salvato per colazione abituale"
+        },
+        {
+          "id": 2,
+          "type": "Pranzo",
+          "description": "Panino senza mollica (~65g) con fesa di tacchino (~75g), scaglie di grana (~15g), pomodoro a fette",
+          "kcal": 365.0,
+          "protein_g": 28.0,
+          "carbs_g": 37.0,
+          "fat_g": 11.0,
+          "sugars_g": 2.0,
+          "water_l": 0.0,
+          "notes": "Panino senza mollica con fesa di tacchino, scaglie di grana e pomodoro"
+        },
+        {
+          "id": 3,
+          "type": "Cena",
+          "description": "Big Tasty Tex-Mex, patatine medie, 6 nuggets, 3 chicken strips",
+          "kcal": 1764.0,
+          "protein_g": 87.0,
+          "carbs_g": 125.0,
+          "fat_g": 100.0,
+          "sugars_g": 12.0,
+          "water_l": 0.0,
+          "notes": "Cena fuori McDonald's: Big Tasty Tex-Mex, patatine medie, 6 nuggets, 3 chicken strips"
+        },
+        {
+          "id": 4,
+          "type": "Bevande",
+          "description": "Thé al limone Zero + acqua",
+          "kcal": 5.0,
+          "protein_g": 0.0,
+          "carbs_g": 1.0,
+          "fat_g": 0.0,
+          "sugars_g": 0.0,
+          "water_l": 1.8,
+          "notes": "Thé al limone Zero + acqua abbondante"
+        }
+      ],
+      "total_kcal": 2544.0,
+      "total_protein": 140.0,
+      "total_carbs": 199.0,
+      "total_fat": 128.0,
+      "total_sugars": 20.0,
+      "total_water_l": 2.0,
+      "daily_notes": "",
+      "steps": 8933,
+      "active_kcal": 694.0,
+      "resting_kcal": 1750.0,
+      "real_tdee": 2444.0
+    },
+    "2026-10-24": {
+      "date": "2026-10-24",
+      "weekday": "Sabato",
+      "meals": [
+        {
+          "id": 1,
+          "type": "Colazione",
+          "description": "Mezza schiacciata genovese con prosciutto cotto (~45g)",
+          "kcal": 375.0,
+          "protein_g": 15.0,
+          "carbs_g": 38.5,
+          "fat_g": 17.5,
+          "sugars_g": 2.0,
+          "water_l": 0.0,
+          "notes": "Mezza schiacciata genovese con prosciutto cotto"
+        },
+        {
+          "id": 2,
+          "type": "Pranzo",
+          "description": "200g gnocchi con 200g zucca Delica, 100g ricotta proteica Lidl + olio EVO",
+          "kcal": 485.0,
+          "protein_g": 21.0,
+          "carbs_g": 79.5,
+          "fat_g": 9.0,
+          "sugars_g": 7.0,
+          "water_l": 0.0,
+          "notes": "Gnocchi con zucca Delica e ricotta proteica Lidl"
+        },
+        {
+          "id": 3,
+          "type": "Snack",
+          "description": "Assaggi di salame al tartufo e formaggi tipici alla fiera (~40g tot.)",
+          "kcal": 150.0,
+          "protein_g": 9.0,
+          "carbs_g": 1.0,
+          "fat_g": 12.5,
+          "sugars_g": 0.0,
+          "water_l": 0.0,
+          "notes": "Pomeriggio alla fiera: degustazione salame al tartufo e formaggi tipici"
+        },
+        {
+          "id": 4,
+          "type": "Snack",
+          "description": "Aperitivo: Caipiroska alla fragola + stuzzichini misti di accompagnamento",
+          "kcal": 380.0,
+          "protein_g": 3.0,
+          "carbs_g": 35.0,
+          "fat_g": 9.0,
+          "sugars_g": 24.0,
+          "water_l": 0.0,
+          "notes": "Aperitivo con cocktail e stuzzichini"
+        },
+        {
+          "id": 5,
+          "type": "Cena",
+          "description": "Pizza San Daniele intera (pomodoro, mozzarella, crudo San Daniele)",
+          "kcal": 930.0,
+          "protein_g": 42.0,
+          "carbs_g": 115.0,
+          "fat_g": 32.0,
+          "sugars_g": 6.0,
+          "water_l": 1.5,
+          "notes": "Pizza San Daniele intera + idratazione"
+        }
+      ],
+      "total_kcal": 2320.0,
+      "total_protein": 90.0,
+      "total_carbs": 269.0,
+      "total_fat": 80.0,
+      "total_sugars": 39.0,
+      "total_water_l": 1.5,
+      "daily_notes": "",
+      "steps": 15019,
+      "active_kcal": 861.0,
+      "resting_kcal": 1750.0,
+      "real_tdee": 2611.0
+    },
+    "2026-10-25": {
+      "date": "2026-10-25",
+      "weekday": "Domenica",
+      "meals": [
+        {
+          "id": 1,
+          "type": "Colazione",
+          "description": "Mezzo paninetto al tartufo + 4 caldarroste (~35-40g)",
+          "kcal": 225.0,
+          "protein_g": 8.5,
+          "carbs_g": 36.5,
+          "fat_g": 4.0,
+          "sugars_g": 4.5,
+          "water_l": 0.0,
+          "notes": "Mezzo paninetto con prosciutto al tartufo e caldarroste"
+        },
+        {
+          "id": 2,
+          "type": "Pranzo",
+          "description": "200g Fesa magra di manzo, zucchine e zucca gratinate, 50g pane",
+          "kcal": 530.0,
+          "protein_g": 49.5,
+          "carbs_g": 44.0,
+          "fat_g": 13.2,
+          "sugars_g": 5.0,
+          "water_l": 0.0,
+          "notes": "Fesa magra di manzo ai ferri, verdure gratinate e pane"
+        },
+        {
+          "id": 3,
+          "type": "Snack",
+          "description": "Aperitivo Shirley Temple (ginger ale + granatina) + 1 Bacio di dama",
+          "kcal": 213.0,
+          "protein_g": 1.0,
+          "carbs_g": 41.0,
+          "fat_g": 5.5,
+          "sugars_g": 34.5,
+          "water_l": 0.0,
+          "notes": "Aperitivo analcolico Shirley Temple e bacio di dama"
+        },
+        {
+          "id": 4,
+          "type": "Cena",
+          "description": "6 Gyoza misti non fritti, 3 tentacoli di polpo a doppia cottura su purea di ceci e riduzione di melograno",
+          "kcal": 608.0,
+          "protein_g": 54.5,
+          "carbs_g": 55.0,
+          "fat_g": 19.5,
+          "sugars_g": 11.0,
+          "water_l": 0.0,
+          "notes": "Gyoza misti al vapore, polpo su purea di ceci e riduzione di melograno"
+        },
+        {
+          "id": 5,
+          "type": "Bevande",
+          "description": "1 lattina Red Bull standard (250ml) + abbondante acqua",
+          "kcal": 115.0,
+          "protein_g": 0.0,
+          "carbs_g": 27.0,
+          "fat_g": 0.0,
+          "sugars_g": 27.0,
+          "water_l": 2.0,
+          "notes": "1 Red Bull normale da 250ml + acqua"
+        }
+      ],
+      "total_kcal": 1691.0,
+      "total_protein": 113.5,
+      "total_carbs": 203.5,
+      "total_fat": 42.2,
+      "total_sugars": 82.0,
+      "total_water_l": 2.0,
+      "daily_notes": "",
+      "steps": 8953,
+      "active_kcal": 503.0,
+      "resting_kcal": 1750.0,
+      "real_tdee": 2253.0
+    },
+    "2026-10-26": {
+      "date": "2026-10-26",
+      "weekday": "Lunedì",
+      "meals": [
+        {
+          "id": 1,
+          "type": "Colazione",
+          "description": "Digiuno mattutino",
+          "kcal": 0.0,
+          "protein_g": 0.0,
+          "carbs_g": 0.0,
+          "fat_g": 0.0,
+          "sugars_g": 0.0,
+          "water_l": 0.0,
+          "notes": "Digiuno fino a pranzo (post-viaggio)"
+        },
+        {
+          "id": 2,
+          "type": "Pranzo",
+          "description": "Pasta al pomodoro (100g semola, sugo pomodoro con olio, 25-30g grana) + 2 fette salame (~25-30g) + Spuma Tomarchio (33cl)",
+          "kcal": 780.0,
+          "protein_g": 28.0,
+          "carbs_g": 111.0,
+          "fat_g": 24.0,
+          "sugars_g": 40.0,
+          "water_l": 0.0,
+          "notes": "Pranzo post-viaggio: pasta al sugo e grana, assaggio salame, Spuma Tomarchio (33g zuccheri)"
+        },
+        {
+          "id": 3,
+          "type": "Snack",
+          "description": "FuzeTea al limone (lattina 330ml)",
+          "kcal": 63.0,
+          "protein_g": 0.0,
+          "carbs_g": 14.2,
+          "fat_g": 0.0,
+          "sugars_g": 14.2,
+          "water_l": 0.0,
+          "notes": "FuzeTea limone da 330ml (~14g zuccheri)"
+        },
+        {
+          "id": 4,
+          "type": "Cena",
+          "description": "Panino svuotato della mollica (~60-70g) con 6 polpette di carne mista al sugo (~220-250g)",
+          "kcal": 585.0,
+          "protein_g": 38.0,
+          "carbs_g": 47.0,
+          "fat_g": 25.7,
+          "sugars_g": 5.5,
+          "water_l": 2.0,
+          "notes": "Panino svuotato con polpette al sugo fatte in casa + idratazione abbondante"
+        }
+      ],
+      "total_kcal": 1428.0,
+      "total_protein": 66.0,
+      "total_carbs": 172.2,
+      "total_fat": 49.7,
+      "total_sugars": 59.7,
+      "total_water_l": 2.0,
+      "daily_notes": "",
+      "steps": 6733,
+      "active_kcal": 551.0,
+      "resting_kcal": 1750.0,
+      "real_tdee": 2301.0
+    },
+    "2026-10-27": {
+      "date": "2026-10-27",
+      "weekday": "Martedì",
+      "meals": [
+        {
+          "id": 1,
+          "type": "Colazione",
+          "description": "Porridge Marco (40g avena, 20g whey cioccolato, 10g chia, 15g fondente 70%, 5g anacardi, 150ml latte mandorla zero)",
+          "kcal": 412.0,
+          "protein_g": 25.2,
+          "carbs_g": 36.5,
+          "fat_g": 17.3,
+          "sugars_g": 6.5,
+          "water_l": 0.0,
+          "notes": "Porridge abituale al cioccolato e anacardi"
+        },
+        {
+          "id": 2,
+          "type": "Pranzo",
+          "description": "Vellutata di zucca Gastronauta (350g), spiedino di pollo bardato (~180g), Grana Padano (25g), pane comune (45g), salame Alba (20g)",
+          "kcal": 693.0,
+          "protein_g": 54.9,
+          "carbs_g": 38.6,
+          "fat_g": 33.9,
+          "sugars_g": 7.5,
+          "water_l": 0.0,
+          "notes": "Vellutata di zucca con spiedino pollo bardato, grana e salame Alba"
+        },
+        {
+          "id": 3,
+          "type": "Snack",
+          "description": "Frutta secca sgusciata Ventura (bustina 28g)",
+          "kcal": 169.0,
+          "protein_g": 5.9,
+          "carbs_g": 2.6,
+          "fat_g": 14.3,
+          "sugars_g": 1.2,
+          "water_l": 0.0,
+          "notes": "Snack frutta secca Ventura (28g)"
+        },
+        {
+          "id": 4,
+          "type": "Cena",
+          "description": "2 fette pollo panato (~130g cotto), mezzo panino (~45g) con salsa BBQ (15-20g), verdura mista (cavoletti e peperoni, ~150g con olio), salame Alba (30g)",
+          "kcal": 602.0,
+          "protein_g": 38.3,
+          "carbs_g": 54.8,
+          "fat_g": 26.6,
+          "sugars_g": 12.0,
+          "water_l": 1.8,
+          "notes": "Pollo panato, mezzo panino con BBQ, verdure e salame Alba + idratazione"
+        }
+      ],
+      "total_kcal": 1876.0,
+      "total_protein": 124.3,
+      "total_carbs": 132.5,
+      "total_fat": 92.1,
+      "total_sugars": 27.2,
+      "total_water_l": 1.8,
+      "daily_notes": "",
+      "steps": 3292,
+      "active_kcal": 459.0,
+      "resting_kcal": 1750.0,
+      "real_tdee": 2209.0
+    },
+    "2026-10-28": {
+      "date": "2026-10-28",
+      "weekday": "Mercoledì",
+      "meals": [
+        {
+          "id": 1,
+          "type": "Colazione",
+          "description": "Porridge abituale (07:00)",
+          "kcal": 410.0,
+          "protein_g": 28.0,
+          "carbs_g": 38.0,
+          "fat_g": 15.0,
+          "sugars_g": 6.0,
+          "water_l": 0.0,
+          "notes": "Porridge mattutino alle 07:00"
+        },
+        {
+          "id": 2,
+          "type": "Pranzo",
+          "description": "Sushi + Salmon Teriyaki (17:30)",
+          "kcal": 447.0,
+          "protein_g": 15.4,
+          "carbs_g": 75.0,
+          "fat_g": 8.6,
+          "sugars_g": 9.0,
+          "water_l": 0.0,
+          "notes": "Pasto pomeridiano (17:30): Sushi e Salmone Teriyaki"
+        },
+        {
+          "id": 3,
+          "type": "Cena",
+          "description": "Pollo Thai Red Curry + Konjac (Cena)",
+          "kcal": 520.0,
+          "protein_g": 59.7,
+          "carbs_g": 18.8,
+          "fat_g": 20.0,
+          "sugars_g": 5.0,
+          "water_l": 2.0,
+          "notes": "Pollo Thai Red Curry ad alto contenuto proteico con Konjac noodles"
+        }
+      ],
+      "total_kcal": 1377.0,
+      "total_protein": 103.1,
+      "total_carbs": 131.8,
+      "total_fat": 43.6,
+      "total_sugars": 20.0,
+      "total_water_l": 2.0,
+      "daily_notes": "",
+      "steps": 5009,
+      "active_kcal": 371.0,
+      "resting_kcal": 1750.0,
+      "real_tdee": 2121.0
+    },
+    "2026-10-29": {
+      "date": "2026-10-29",
+      "weekday": "Giovedì",
+      "meals": [
+        {
+          "id": 1,
+          "type": "Colazione",
+          "description": "Colazione (Porridge 2 con yogurt, 20g avena, 10g whey, 5g chia, 15g fondente, 5g anacardi)",
+          "kcal": 296.0,
+          "protein_g": 21.0,
+          "carbs_g": 21.3,
+          "fat_g": 13.3,
+          "sugars_g": 5.0,
+          "water_l": 0.0,
+          "notes": "Preset 2: Porridge yogurt"
+        },
+        {
+          "id": 2,
+          "type": "Snack",
+          "description": "Spuntino (Gallette + Yogurt + 1/2 banana)",
+          "kcal": 195.0,
+          "protein_g": 12.2,
+          "carbs_g": 35.6,
+          "fat_g": 0.6,
+          "sugars_g": 14.0,
+          "water_l": 0.0,
+          "notes": "Gallette con yogurt e mezza banana"
+        },
+        {
+          "id": 3,
+          "type": "Snack",
+          "description": "Sfizio (Salame di Alba)",
+          "kcal": 80.0,
+          "protein_g": 5.2,
+          "carbs_g": 0.2,
+          "fat_g": 6.6,
+          "sugars_g": 0.0,
+          "water_l": 0.0,
+          "notes": "Salame di Alba (~20g)"
+        },
+        {
+          "id": 4,
+          "type": "Pranzo",
+          "description": "Pranzo (Gnocchetti e ricotta + 1/2 banana)",
+          "kcal": 471.0,
+          "protein_g": 15.5,
+          "carbs_g": 77.3,
+          "fat_g": 11.1,
+          "sugars_g": 14.0,
+          "water_l": 0.0,
+          "notes": "Gnocchetti con ricotta e seconda mezza banana"
+        },
+        {
+          "id": 5,
+          "type": "Cena",
+          "description": "Cena (Pulled chicken + Riso + Olio)",
+          "kcal": 483.0,
+          "protein_g": 52.1,
+          "carbs_g": 45.0,
+          "fat_g": 8.5,
+          "sugars_g": 2.0,
+          "water_l": 2.0,
+          "notes": "Pulled chicken con riso e filo d'olio + idratazione"
+        }
+      ],
+      "total_kcal": 1525.0,
+      "total_protein": 106.0,
+      "total_carbs": 179.4,
+      "total_fat": 40.1,
+      "total_sugars": 35.0,
+      "total_water_l": 2.0,
+      "daily_notes": "",
+      "steps": 4532,
+      "active_kcal": 485.0,
+      "resting_kcal": 1750.0,
+      "real_tdee": 2235.0
+    },
+    "2026-10-30": {
+      "date": "2026-10-30",
+      "weekday": "Venerdì",
+      "meals": [
+        {
+          "id": 1,
+          "type": "Colazione",
+          "description": "Colazione (Porridge 1 con 5g anacardi + 20g mirtilli)",
+          "kcal": 398.0,
+          "protein_g": 27.7,
+          "carbs_g": 34.0,
+          "fat_g": 16.3,
+          "sugars_g": 9.5,
+          "water_l": 0.0,
+          "notes": "Porridge 1 con 5g anacardi e 20g mirtilli freschi"
+        },
+        {
+          "id": 2,
+          "type": "Pranzo",
+          "description": "Pranzo (4 fette croccanti, 80g bresaola, 40g stracchino High Protein, lattughino)",
+          "kcal": 475.0,
+          "protein_g": 43.0,
+          "carbs_g": 47.0,
+          "fat_g": 11.8,
+          "sugars_g": 3.5,
+          "water_l": 0.0,
+          "notes": "4 fette croccanti, bresaola, stracchino high protein e insalata"
+        },
+        {
+          "id": 3,
+          "type": "Cena",
+          "description": "Cena (Pollo sfilacciato al pomodoro + 125g riso basmati cotto)",
+          "kcal": 483.0,
+          "protein_g": 52.1,
+          "carbs_g": 45.0,
+          "fat_g": 8.5,
+          "sugars_g": 4.0,
+          "water_l": 2.0,
+          "notes": "Pulled chicken al pomodoro con riso basmati cotto e idratazione"
+        }
+      ],
+      "total_kcal": 1356.0,
+      "total_protein": 122.8,
+      "total_carbs": 126.0,
+      "total_fat": 36.6,
+      "total_sugars": 17.0,
+      "total_water_l": 2.0,
+      "daily_notes": "",
+      "steps": 2990,
+      "active_kcal": 345.0,
+      "resting_kcal": 1750.0,
+      "real_tdee": 2095.0
+    },
+    "2026-10-31": {
+      "date": "2026-10-31",
+      "weekday": "Sabato",
+      "meals": [
+        {
+          "id": 1,
+          "type": "Colazione",
+          "description": "Colazione (3 pancake, yogurt greco 0%, banana, mirtilli, miele, cannella)",
+          "kcal": 535.0,
+          "protein_g": 24.2,
+          "carbs_g": 73.4,
+          "fat_g": 16.6,
+          "sugars_g": 14.0,
+          "water_l": 0.0,
+          "notes": "3 pancake con yogurt greco 0%, banana, mirtilli, miele e cannella"
+        },
+        {
+          "id": 2,
+          "type": "Pranzo",
+          "description": "Pranzo (Poke: riso basmati, salmone, gamberi, edamame, avocado, feta, carote, teriyaki, nori, sesamo)",
+          "kcal": 555.0,
+          "protein_g": 35.1,
+          "carbs_g": 51.2,
+          "fat_g": 24.6,
+          "sugars_g": 7.0,
+          "water_l": 0.0,
+          "notes": "Poke bowl con riso basmati, salmone, gamberi, edamame, avocado, feta, carote, salsa teriyaki, nori e sesamo"
+        },
+        {
+          "id": 3,
+          "type": "Spuntino",
+          "description": "Spuntino (Salame di Alba 30 g)",
+          "kcal": 112.0,
+          "protein_g": 8.1,
+          "carbs_g": 0.3,
+          "fat_g": 8.7,
+          "sugars_g": 0.1,
+          "water_l": 0.0,
+          "notes": "Salame di Alba 30 g"
+        },
+        {
+          "id": 4,
+          "type": "Cena",
+          "description": "Cena (Patata dolce + Macinato + Stracchino HP + Pomodoro)",
+          "kcal": 810.0,
+          "protein_g": 60.7,
+          "carbs_g": 109.4,
+          "fat_g": 15.5,
+          "sugars_g": 11.0,
+          "water_l": 2.0,
+          "notes": "Patata dolce, macinato magro, stracchino High Protein e pomodoro"
+        }
+      ],
+      "total_kcal": 2012.0,
+      "total_protein": 128.1,
+      "total_carbs": 234.3,
+      "total_fat": 65.4,
+      "total_sugars": 32.1,
+      "total_water_l": 2.0,
+      "daily_notes": "Sabato con colazione a base di pancake, yogurt greco e frutta, poke a pranzo (grassi insaturi da salmone e avocado) e cena con patata dolce, macinato e stracchino HP.",
+      "steps": 4638,
+      "active_kcal": 351.0,
+      "resting_kcal": 1750.0,
+      "real_tdee": 2101.0
+    },
+    "2026-11-01": {
+      "date": "2026-11-01",
+      "weekday": "Domenica",
+      "meals": [
+        {
+          "id": 1,
+          "type": "Colazione",
+          "description": "Porridge Preset 1 con banana e mirtilli (40g fiocchi d'avena, 20g whey cioccolato, 150ml latte mandorla zero, 10g chia, 10g fondente 85%, 5g anacardi, 60g banana, 20g mirtilli)",
+          "kcal": 456.0,
+          "protein_g": 26.4,
+          "carbs_g": 47.2,
+          "fat_g": 15.2,
+          "sugars_g": 15.0,
+          "water_l": 0.5,
+          "notes": "Colazione Preset 1 con frutta fresca: banana (60g) e mirtilli (20g)"
+        },
+        {
+          "id": 2,
+          "type": "Pranzo",
+          "description": "Anelletti al ragù di manzo con passata e olio EVO (100g pasta anelletti, 100g macinato manzo magro 5%, 150g passata pomodoro, 10g olio EVO)",
+          "kcal": 606.0,
+          "protein_g": 33.2,
+          "carbs_g": 87.6,
+          "fat_g": 16.3,
+          "sugars_g": 6.0,
+          "water_l": 0.8,
+          "notes": "Primo piatto bilanciato con macinato manzo 5% e olio EVO misurato"
+        },
+        {
+          "id": 3,
+          "type": "Cena",
+          "description": "Orata, vellutata di zucca, mezzo panino e olio EVO (200g filetto orata pulito, 300g vellutata zucca, 50g mezzo panino, 5g olio EVO a crudo)",
+          "kcal": 535.0,
+          "protein_g": 48.0,
+          "carbs_g": 42.0,
+          "fat_g": 18.0,
+          "sugars_g": 8.0,
+          "water_l": 1.2,
+          "notes": "Cena proteica (48g pro) ad alta digeribilità con orata e zucca"
+        }
+      ],
+      "total_kcal": 1597.0,
+      "total_protein": 107.6,
+      "total_carbs": 176.8,
+      "total_fat": 49.5,
+      "total_sugars": 29.0,
+      "total_water_l": 2.5,
+      "daily_notes": "Pesata Domenicale: 87.9 kg (-0.9 kg rispetto a Settimana 1!). Target 78.0 kg ora a -9.9 kg. Alimentazione perfetta: 1597 kcal (~target 1600), grassi 49.5g (<50g) e zuccheri 29g (<40g).",
+      "steps": 0,
+      "active_kcal": 400.0,
+      "resting_kcal": 1750.0,
+      "real_tdee": 2150.0
+    }
+  }
+}
+"""#
+}
