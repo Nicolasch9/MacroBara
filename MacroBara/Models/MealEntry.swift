@@ -79,7 +79,20 @@ final class MealEntry {
     }
     
     var mealType: MealType {
-        get { MealType(rawValue: mealTypeRaw) ?? .colazione }
+        get {
+            if let direct = MealType(rawValue: mealTypeRaw) {
+                return direct
+            }
+            let lower = mealTypeRaw.lowercased()
+            if lower.contains("spuntino") || lower.contains("snack") {
+                return .spuntino
+            }
+            if lower.contains("colazione") { return .colazione }
+            if lower.contains("pranzo") { return .pranzo }
+            if lower.contains("cena") { return .cena }
+            if lower.contains("bevande") { return .bevande }
+            return .colazione
+        }
         set { mealTypeRaw = newValue.rawValue }
     }
 }

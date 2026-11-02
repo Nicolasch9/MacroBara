@@ -41,10 +41,22 @@ struct ContentView: View {
             seedProfileIfNeeded()
             DataImporter.shared.consolidateAndDeduplicate(modelContext: modelContext)
             DataImporter.shared.importHistoryIfNeeded(modelContext: modelContext)
+            syncWidgetData()
             if ICloudSyncService.shared.isFolderLinked {
                 await ICloudSyncService.shared.exportHealthDataToICloud()
             }
         }
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.willEnterForegroundNotification)) { _ in
+            syncWidgetData()
+        }
+    }
+    
+    private func syncWidgetData() {
+        let todayStr = DailyLog.dateFormatter.string(from: Date())
+        let logDescriptor = FetchDescriptor<DailyLog>()
+        let allLogs = (try? modelContext.fetch(logDescriptor)) ?? []
+        let todayLog = allLogs.first(where: { $0.dateString == todayStr })
+        WidgetSyncManager.shared.syncWidget(todayLog: todayLog, profile: profiles.first, allLogs: allLogs)
     }
     
     private func seedProfileIfNeeded() {

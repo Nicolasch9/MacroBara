@@ -78,7 +78,8 @@ final class DailyLog {
     }
     
     var realTdee: Double {
-        let bmr = max(restingKcal, 1750.0)
+        // Il metabolismo basale (BMR) è rigorosamente ancorato a 1.750 kcal come da profilo nutrizionale
+        let bmr = (restingKcal >= 1500.0 && restingKcal <= 1850.0) ? restingKcal : 1750.0
         if activeKcal > 0 {
             return max(2150.0, bmr + activeKcal)
         }

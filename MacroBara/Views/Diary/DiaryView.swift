@@ -292,7 +292,7 @@ struct DiaryView: View {
     private func mealCard(_ meal: MealEntry) -> some View {
         GlassCard {
             VStack(alignment: .leading, spacing: 10) {
-                HStack {
+                HStack(alignment: .center) {
                     Image(systemName: meal.mealType.iconName)
                         .foregroundStyle(Theme.accentEmerald)
                     Text(meal.title)
@@ -303,6 +303,18 @@ struct DiaryView: View {
                     Text("\(Int(meal.kcal)) kcal")
                         .font(.system(.subheadline, design: .rounded).bold())
                         .foregroundStyle(Theme.accentCyan)
+                    
+                    Button(role: .destructive) {
+                        deleteMeal(meal)
+                    } label: {
+                        Image(systemName: "trash")
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundStyle(Theme.coralTerracotta)
+                            .padding(6)
+                            .background(Theme.coralTerracotta.opacity(0.12))
+                            .clipShape(Circle())
+                    }
+                    .buttonStyle(.borderless)
                 }
                 
                 Text(meal.foodDescription)
@@ -325,14 +337,28 @@ struct DiaryView: View {
         }
         .contextMenu {
             Button(role: .destructive) {
-                if let idx = activeLog.meals.firstIndex(where: { $0.id == meal.id }) {
-                    let mealToDelete = activeLog.meals.remove(at: idx)
-                    modelContext.delete(mealToDelete)
-                    try? modelContext.save()
-                }
+                deleteMeal(meal)
             } label: {
                 Label("Elimina pasto", systemImage: "trash")
             }
+        }
+    }
+    
+    private func deleteMeal(_ meal: MealEntry) {
+        withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
+            if let idx = activeLog.meals.firstIndex(where: { $0.id == meal.id }) {
+                activeLog.meals.remove(at: idx)
+            }
+            modelContext.delete(meal)
+            try? modelContext.save()
+            
+            let todayStr = DailyLog.dateFormatter.string(from: Date())
+            let logDesc = FetchDescriptor<DailyLog>()
+            let allLogs = (try? modelContext.fetch(logDesc)) ?? []
+            let todayLog = allLogs.first(where: { $0.dateString == todayStr })
+            let profileDesc = FetchDescriptor<UserProfile>()
+            let profile = (try? modelContext.fetch(profileDesc))?.first
+            WidgetSyncManager.shared.syncWidget(todayLog: todayLog, profile: profile, allLogs: allLogs)
         }
     }
     

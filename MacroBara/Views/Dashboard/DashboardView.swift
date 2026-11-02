@@ -48,11 +48,15 @@ struct DashboardView: View {
     
     private var todayLog: DailyLog {
         let todayStr = DailyLog.dateFormatter.string(from: Date())
+        let bmr = currentProfile.bmrKcal > 0 ? currentProfile.bmrKcal : 1750.0
         if let existing = logs.first(where: { $0.dateString == todayStr && !$0.meals.isEmpty }) ??
                           logs.first(where: { $0.dateString == todayStr }) {
+            if existing.restingKcal != bmr {
+                existing.restingKcal = bmr
+            }
             return existing
         }
-        return DailyLog(date: Date(), restingKcal: currentProfile.bmrKcal)
+        return DailyLog(date: Date(), restingKcal: bmr)
     }
     
     private var grade: DailyGrade {
@@ -61,12 +65,13 @@ struct DashboardView: View {
     
     private var greetingText: String {
         let hour = Calendar.current.component(.hour, from: Date())
+        let name = currentProfile.name.split(separator: " ").first.map(String.init) ?? "Zen"
         if hour < 12 {
-            return "Morning, Marco"
+            return "Buongiorno, \(name)"
         } else if hour < 18 {
-            return "Pomeriggio, Marco"
+            return "Pomeriggio, \(name)"
         } else {
-            return "Buonasera, Marco"
+            return "Buonasera, \(name)"
         }
     }
     
@@ -147,13 +152,89 @@ struct DashboardView: View {
         return (max(1, streak), bestStreak, last14Items)
     }
     
-    private var weeklyDeficitStats: (avgDeficit: Double, totalDeficit: Double, fatLossKg: Double) {
-        let recent7 = logs.sorted(by: { $0.date > $1.date }).prefix(7)
-        guard !recent7.isEmpty else { return (620, 4340, 0.56) }
-        let total = recent7.reduce(0.0) { $0 + max(0, $1.realTdee - $1.totalKcal) }
-        let avg = total / Double(recent7.count)
-        let fat = total / 7700.0
-        return (avg.rounded(), total.rounded(), (fat * 100).rounded() / 100)
+    private var currentWeekStats: (
+        avgDeficit: Double,
+        totalDeficit: Double,
+        fatLossKg: Double,
+        daysLoggedCount: Int,
+        weekLabel: String,
+        dayStatuses: [(shortName: String, fullName: String, dateStr: String, isToday: Bool, isTracked: Bool, deficit: Double)]
+    ) {
+        let calendar = Calendar.current
+        let today = Date()
+        
+        // Calcola Lunedì (inizio) e Domenica (fine) della settimana ISO corrente
+        let weekday = (calendar.component(.weekday, from: today) + 5) % 7 // 0 = Lun, ..., 6 = Dom
+        let monday = calendar.date(byAdding: .day, value: -weekday, to: calendar.startOfDay(for: today)) ?? today
+        let sunday = calendar.date(byAdding: .day, value: 6, to: monday) ?? today
+        
+        let dateFormatter = DailyLog.dateFormatter
+        let mondayStr = dateFormatter.string(from: monday)
+        let sundayStr = dateFormatter.string(from: sunday)
+        let todayStr = dateFormatter.string(from: today)
+        
+        // Raggruppa e deduplica rigorosamente per dateString (nessun giorno contato due volte!)
+        var uniqueLogs: [String: DailyLog] = [:]
+        for log in logs {
+            guard log.dateString >= mondayStr && log.dateString <= sundayStr else { continue }
+            if let existing = uniqueLogs[log.dateString] {
+                if log.meals.count > existing.meals.count || log.totalKcal > existing.totalKcal {
+                    uniqueLogs[log.dateString] = log
+                }
+            } else {
+                uniqueLogs[log.dateString] = log
+            }
+        }
+        
+        let canonicalWeekLogs = Array(uniqueLogs.values)
+        let daysLogged = max(1, canonicalWeekLogs.filter { !$0.meals.isEmpty }.count)
+        
+        let totalDeficit = canonicalWeekLogs.reduce(0.0) { sum, log in
+            // Se il log non ha pasti e non è oggi, non contarlo nel deficit
+            if log.meals.isEmpty && log.dateString != todayStr { return sum }
+            let bmr = (log.restingKcal >= 1500.0 && log.restingKcal <= 1850.0) ? log.restingKcal : 1750.0
+            let active = log.activeKcal > 0 ? log.activeKcal : 400.0
+            let tdee = max(2150.0, bmr + active)
+            let deficit = max(0.0, tdee - log.totalKcal)
+            return sum + deficit
+        }
+        
+        let avgDeficit = totalDeficit / Double(daysLogged)
+        let fatLoss = totalDeficit / 7700.0
+        
+        let dayFormat = DateFormatter()
+        dayFormat.locale = Locale(identifier: "it_IT")
+        dayFormat.dateFormat = "d MMM"
+        let weekLabel = "\(dayFormat.string(from: monday)) - \(dayFormat.string(from: sunday))"
+        
+        // Genera i 7 giorni della settimana corrente (Lun -> Dom)
+        let dayNames = [("L", "Lunedì"), ("M", "Martedì"), ("M", "Mercoledì"), ("G", "Giovedì"), ("V", "Venerdì"), ("S", "Sabato"), ("D", "Domenica")]
+        var dayStatuses: [(shortName: String, fullName: String, dateStr: String, isToday: Bool, isTracked: Bool, deficit: Double)] = []
+        for i in 0..<7 {
+            if let d = calendar.date(byAdding: .day, value: i, to: monday) {
+                let dStr = dateFormatter.string(from: d)
+                let isTod = (dStr == todayStr)
+                let dayLog = uniqueLogs[dStr]
+                let isTrk = (dayLog != nil && !dayLog!.meals.isEmpty) || (isTod && todayLog.totalKcal > 0)
+                let rawBmr = dayLog?.restingKcal ?? (isTod ? todayLog.restingKcal : 1750.0)
+                let dayBmr = (rawBmr >= 1500.0 && rawBmr <= 1850.0) ? rawBmr : 1750.0
+                let dayActive = (dayLog?.activeKcal ?? 0) > 0 ? (dayLog?.activeKcal ?? 400.0) : (isTod ? (todayLog.activeKcal > 0 ? todayLog.activeKcal : 400.0) : 400.0)
+                let dayTdee = max(2150.0, dayBmr + dayActive)
+                let dayFood = dayLog?.totalKcal ?? (isTod ? todayLog.totalKcal : 0.0)
+                let dayDeficit = isTrk ? max(0.0, dayTdee - dayFood) : 0.0
+                let (shortN, fullN) = dayNames[i]
+                dayStatuses.append((shortName: shortN, fullName: fullN, dateStr: dStr, isToday: isTod, isTracked: isTrk, deficit: dayDeficit))
+            }
+        }
+        
+        return (
+            avgDeficit: avgDeficit.rounded(),
+            totalDeficit: totalDeficit.rounded(),
+            fatLossKg: (fatLoss * 100).rounded() / 100,
+            daysLoggedCount: daysLogged,
+            weekLabel: weekLabel,
+            dayStatuses: dayStatuses
+        )
     }
     
     private var bmiValue: Double {
@@ -179,8 +260,8 @@ struct DashboardView: View {
                         // 3. Daily Routine (Timeline Pasti Connessa)
                         dailyRoutineSection
                         
-                        // 4. Deficit Medio Settimanale & Lipolisi
-                        weeklyDeficitCard
+                        // 4. Bilancio Energetico & Deficit Odierno / Settimanale
+                        energyBalanceDeficitCard
                         
                         // 5. BMI Gauge & Composizione Corporea
                         bmiGaugeCard
@@ -209,9 +290,11 @@ struct DashboardView: View {
                 if health.activeEnergyBurnedKcal > 0 {
                     todayLog.activeKcal = health.activeEnergyBurnedKcal
                 }
-                if todayLog.restingKcal < 1750.0 {
-                    todayLog.restingKcal = 1750.0
-                }
+                // Il BMR è sempre fissato a 1.750 kcal per il piano nutrizionale
+                let bmr = currentProfile.bmrKcal > 0 ? currentProfile.bmrKcal : 1750.0
+                todayLog.restingKcal = bmr
+                try? modelContext.save()
+                WidgetSyncManager.shared.syncWidget(todayLog: todayLog, profile: profiles.first, allLogs: logs)
             }
             .background(Theme.pageBackground.ignoresSafeArea())
             .navigationBarHidden(true)
@@ -233,11 +316,17 @@ struct DashboardView: View {
                 if health.activeEnergyBurnedKcal > 0 {
                     todayLog.activeKcal = health.activeEnergyBurnedKcal
                 }
-                if health.restingEnergyBurnedKcal >= 1750.0 {
-                    todayLog.restingKcal = health.restingEnergyBurnedKcal
-                } else if todayLog.restingKcal < 1750.0 {
-                    todayLog.restingKcal = 1750.0
+                // Il BMR è sempre fissato a 1.750 kcal per il piano nutrizionale
+                let bmr = currentProfile.bmrKcal > 0 ? currentProfile.bmrKcal : 1750.0
+                todayLog.restingKcal = bmr
+                
+                // Sanifica eventuali record con BMR alterato
+                for l in logs where l.restingKcal > 1850.0 || l.restingKcal < 1500.0 {
+                    l.restingKcal = bmr
                 }
+                
+                try? modelContext.save()
+                WidgetSyncManager.shared.syncWidget(todayLog: todayLog, profile: profiles.first, allLogs: logs)
             }
         }
     }
@@ -523,7 +612,7 @@ struct DashboardView: View {
         let types: [(MealType, String, String, String)] = [
             (.colazione, "08:00", "~410 kcal", "cup.and.saucer.fill"),
             (.pranzo, "13:00", "~550 kcal", "fork.knife"),
-            (.snack, "17:00", "~200 kcal", "apple.logo"),
+            (.spuntino, "17:00", "~200 kcal", "apple.logo"),
             (.cena, "20:30", "~450 kcal", "moon.stars.fill")
         ]
         
@@ -531,7 +620,17 @@ struct DashboardView: View {
         var slots: [RoutineSlot] = []
         
         for (mType, time, hint, icon) in types {
-            let existing = todayLog.meals.first(where: { $0.mealType == mType })
+            let existing = todayLog.meals.first(where: { meal in
+                if meal.mealType == mType { return true }
+                if (mType == .spuntino || mType == .snack) && (meal.mealType == .spuntino || meal.mealType == .snack) {
+                    return true
+                }
+                let raw = meal.mealTypeRaw.lowercased()
+                if (mType == .spuntino || mType == .snack) && (raw.contains("spuntino") || raw.contains("snack")) {
+                    return true
+                }
+                return false
+            })
             var isNext = false
             if existing == nil && !foundNext {
                 isNext = true
@@ -614,8 +713,20 @@ struct DashboardView: View {
             
             Spacer()
             
-            // Badge "Up next" / "Prossimo" come in foto
-            if slot.isNext {
+            if let meal = slot.registeredMeal {
+                Button(role: .destructive) {
+                    deleteMealFromToday(meal)
+                } label: {
+                    Image(systemName: "trash")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(Theme.coralTerracotta)
+                        .padding(8)
+                        .background(Theme.coralTerracotta.opacity(0.12))
+                        .clipShape(Circle())
+                }
+                .buttonStyle(.borderless)
+            } else if slot.isNext {
+                // Badge "Up next" / "Prossimo" come in foto
                 Text("Prossimo")
                     .font(.system(size: 11, weight: .bold, design: .rounded))
                     .padding(.horizontal, 10)
@@ -632,50 +743,315 @@ struct DashboardView: View {
         }
     }
     
-    // MARK: - 3. Deficit Medio Settimanale
+    private func deleteMealFromToday(_ meal: MealEntry) {
+        withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
+            if let idx = todayLog.meals.firstIndex(where: { $0.id == meal.id }) {
+                todayLog.meals.remove(at: idx)
+            }
+            modelContext.delete(meal)
+            try? modelContext.save()
+            WidgetSyncManager.shared.syncWidget(todayLog: todayLog, profile: profiles.first, allLogs: logs)
+        }
+    }
     
-    private var weeklyDeficitCard: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            HStack {
+    // MARK: - 3. Bilancio Energetico & Deficit
+    
+    private var energyBalanceDeficitCard: some View {
+        let stats = currentWeekStats
+        let bmr = currentProfile.bmrKcal > 0 ? currentProfile.bmrKcal : 1750.0
+        let active = todayLog.activeKcal > 0 ? todayLog.activeKcal : 400.0
+        let tdee = max(2150.0, bmr + active)
+        let food = todayLog.totalKcal
+        let todayDeficit = max(0.0, tdee - food)
+        
+        return VStack(alignment: .leading, spacing: 16) {
+            // Header
+            HStack(alignment: .center) {
                 HStack(spacing: 8) {
-                    Text("⚡")
-                        .font(.system(size: 20))
-                    Text("DEFICIT MEDIO & LIPOLISI")
+                    Image(systemName: "bolt.fill")
+                        .font(.system(size: 14, weight: .bold))
+                        .foregroundStyle(Color(red: 99/255, green: 102/255, blue: 241/255))
+                        .padding(6)
+                        .background(Color(red: 99/255, green: 102/255, blue: 241/255).opacity(0.12))
+                        .clipShape(Circle())
+                    
+                    Text("BILANCIO ENERGETICO & DEFICIT")
                         .font(.system(size: 11, weight: .bold, design: .rounded))
                         .foregroundStyle(.secondary)
                 }
+                
                 Spacer()
-                Text("Ultimi 7 giorni")
-                    .font(.system(size: 11, weight: .semibold, design: .rounded))
-                    .foregroundStyle(.secondary)
+                
+                Text(stats.weekLabel)
+                    .font(.system(size: 11, weight: .bold, design: .rounded))
+                    .foregroundStyle(Theme.coralTerracotta)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(Theme.coralTerracotta.opacity(0.12))
+                    .clipShape(Capsule())
             }
             
-            HStack(spacing: 16) {
-                VStack(alignment: .leading, spacing: 3) {
-                    Text("-\(Int(weeklyDeficitStats.avgDeficit))")
-                        .font(.system(size: 30, weight: .heavy, design: .rounded))
+            // Dual KPI Cards: Oggi vs Media Settimana
+            HStack(spacing: 12) {
+                // Card Sinistra: Deficit Odierno
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("DEFICIT OGGI")
+                        .font(.system(size: 10, weight: .bold, design: .rounded))
+                        .foregroundStyle(.secondary)
+                    
+                    HStack(alignment: .firstTextBaseline, spacing: 2) {
+                        Text("-\(Int(todayDeficit))")
+                            .font(.system(size: 26, weight: .heavy, design: .rounded))
+                            .foregroundStyle(Color(red: 16/255, green: 185/255, blue: 129/255))
+                        Text("kcal")
+                            .font(.system(size: 12, weight: .bold, design: .rounded))
+                            .foregroundStyle(.secondary)
+                    }
+                    
+                    Text(todayDeficit >= 500 && todayDeficit <= 750 ? "Target ottimale lipolisi" : "Bilancio attuale")
+                        .font(.system(size: 10, weight: .semibold, design: .rounded))
                         .foregroundStyle(Color(red: 16/255, green: 185/255, blue: 129/255))
-                    Text("kcal/die di deficit medio")
-                        .font(.system(size: 12, weight: .medium, design: .rounded))
+                }
+                .padding(12)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color(red: 16/255, green: 185/255, blue: 129/255).opacity(0.08))
+                .clipShape(RoundedRectangle(cornerRadius: 16))
+                
+                // Card Destra: Media Settimanale
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("MEDIA SETTIMANA")
+                        .font(.system(size: 10, weight: .bold, design: .rounded))
                         .foregroundStyle(.secondary)
+                    
+                    HStack(alignment: .firstTextBaseline, spacing: 2) {
+                        Text("-\(Int(stats.avgDeficit))")
+                            .font(.system(size: 26, weight: .heavy, design: .rounded))
+                            .foregroundStyle(Theme.coralTerracotta)
+                        Text("kcal/g")
+                            .font(.system(size: 12, weight: .bold, design: .rounded))
+                            .foregroundStyle(.secondary)
+                    }
+                    
+                    Text("~\(String(format: "%.2f", stats.fatLossKg)) kg grasso (\(stats.daysLoggedCount)/7 gg)")
+                        .font(.system(size: 10, weight: .semibold, design: .rounded))
+                        .foregroundStyle(Theme.coralTerracotta)
+                }
+                .padding(12)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Theme.coralTerracotta.opacity(0.08))
+                .clipShape(RoundedRectangle(cornerRadius: 16))
+            }
+            
+            // Sezione Composizione Spesa Energetica (TDEE)
+            VStack(alignment: .leading, spacing: 8) {
+                HStack {
+                    Text("DOVE CONSUMI LE CALORIE (SPESA: \(Int(tdee)) KCAL)")
+                        .font(.system(size: 10, weight: .bold, design: .rounded))
+                        .foregroundStyle(.secondary)
+                    Spacer()
                 }
                 
-                Spacer()
+                // Barra segmentata proporzionale TDEE
+                GeometryReader { geo in
+                    let bmrRatio = tdee > 0 ? (bmr / tdee) : 0.8
+                    let bmrWidth = max(20, geo.size.width * CGFloat(bmrRatio))
+                    let activeWidth = max(20, geo.size.width - bmrWidth)
+                    
+                    HStack(spacing: 3) {
+                        // Basale (Indigo)
+                        RoundedRectangle(cornerRadius: 6)
+                            .fill(Color(red: 99/255, green: 102/255, blue: 241/255))
+                            .frame(width: bmrWidth - 2, height: 12)
+                        
+                        // Attive (Orange)
+                        RoundedRectangle(cornerRadius: 6)
+                            .fill(Color(red: 249/255, green: 115/255, blue: 22/255))
+                            .frame(width: activeWidth - 2, height: 12)
+                    }
+                }
+                .frame(height: 12)
                 
-                VStack(alignment: .trailing, spacing: 3) {
-                    Text("~\(String(format: "%.2f", weeklyDeficitStats.fatLossKg)) kg")
-                        .font(.system(size: 22, weight: .bold, design: .rounded))
-                        .foregroundStyle(Theme.coralTerracotta)
-                    Text("grasso ossidato (7.700 kcal/kg)")
-                        .font(.system(size: 11, design: .rounded))
-                        .foregroundStyle(.secondary)
+                // Pillole descrittive dei 2 consumi
+                HStack(spacing: 8) {
+                    // Pillola BMR Basale
+                    HStack(spacing: 6) {
+                        Circle()
+                            .fill(Color(red: 99/255, green: 102/255, blue: 241/255))
+                            .frame(width: 8, height: 8)
+                        VStack(alignment: .leading, spacing: 1) {
+                            HStack(spacing: 3) {
+                                Text("Basale (BMR):")
+                                    .font(.system(size: 11, weight: .bold, design: .rounded))
+                                Text("\(Int(bmr))")
+                                    .font(.system(size: 11, weight: .heavy, design: .rounded))
+                                    .foregroundStyle(Color(red: 99/255, green: 102/255, blue: 241/255))
+                                Text("kcal")
+                                    .font(.system(size: 9, design: .rounded))
+                                    .foregroundStyle(.secondary)
+                            }
+                            Text("Calorie usate per vivere a riposo")
+                                .font(.system(size: 9, design: .rounded))
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .padding(8)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Color(red: 99/255, green: 102/255, blue: 241/255).opacity(0.06))
+                    .clipShape(RoundedRectangle(cornerRadius: 10))
+                    
+                    // Pillola Attive
+                    HStack(spacing: 6) {
+                        Circle()
+                            .fill(Color(red: 249/255, green: 115/255, blue: 22/255))
+                            .frame(width: 8, height: 8)
+                        VStack(alignment: .leading, spacing: 1) {
+                            HStack(spacing: 3) {
+                                Text("Attive:")
+                                    .font(.system(size: 11, weight: .bold, design: .rounded))
+                                Text("\(Int(active))")
+                                    .font(.system(size: 11, weight: .heavy, design: .rounded))
+                                    .foregroundStyle(Color(red: 249/255, green: 115/255, blue: 22/255))
+                                Text("kcal")
+                                    .font(.system(size: 9, design: .rounded))
+                                    .foregroundStyle(.secondary)
+                            }
+                            Text(todayLog.activeKcal > 0 ? "Apple Watch / Movimento" : "Stima movimento base")
+                                .font(.system(size: 9, design: .rounded))
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .padding(8)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Color(red: 249/255, green: 115/255, blue: 22/255).opacity(0.06))
+                    .clipShape(RoundedRectangle(cornerRadius: 10))
                 }
             }
             
-            Text("Deficit cumulato settimana: -\(Int(weeklyDeficitStats.totalDeficit)) kcal. Mantenere 500-700 kcal/die assicura una lipolisi costante proteggendo i tessuti magri.")
+            // Formula Matematica Visiva di Sottrazione
+            VStack(alignment: .leading, spacing: 6) {
+                Text("FORMULA CALCOLO DEFICIT (SPESA − INTROITO)")
+                    .font(.system(size: 10, weight: .bold, design: .rounded))
+                    .foregroundStyle(.secondary)
+                
+                HStack(spacing: 6) {
+                    // Spesa Totale
+                    VStack(spacing: 2) {
+                        Text("\(Int(tdee))")
+                            .font(.system(size: 15, weight: .heavy, design: .rounded))
+                            .foregroundStyle(Color(red: 99/255, green: 102/255, blue: 241/255))
+                        Text("Spesa TDEE")
+                            .font(.system(size: 9, weight: .semibold, design: .rounded))
+                            .foregroundStyle(.secondary)
+                    }
+                    .padding(.vertical, 6)
+                    .padding(.horizontal, 8)
+                    .background(Color(red: 99/255, green: 102/255, blue: 241/255).opacity(0.08))
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
+                    
+                    Text("−")
+                        .font(.system(size: 16, weight: .black, design: .rounded))
+                        .foregroundStyle(.secondary)
+                    
+                    // Cibo Assunto
+                    VStack(spacing: 2) {
+                        Text("\(Int(food))")
+                            .font(.system(size: 15, weight: .heavy, design: .rounded))
+                            .foregroundStyle(Theme.coralTerracotta)
+                        Text("Cibo Ingerito")
+                            .font(.system(size: 9, weight: .semibold, design: .rounded))
+                            .foregroundStyle(.secondary)
+                    }
+                    .padding(.vertical, 6)
+                    .padding(.horizontal, 8)
+                    .background(Theme.coralTerracotta.opacity(0.08))
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
+                    
+                    Text("=")
+                        .font(.system(size: 16, weight: .black, design: .rounded))
+                        .foregroundStyle(.secondary)
+                    
+                    // Deficit Risultante
+                    VStack(spacing: 2) {
+                        Text("-\(Int(todayDeficit))")
+                            .font(.system(size: 16, weight: .black, design: .rounded))
+                            .foregroundStyle(Color(red: 16/255, green: 185/255, blue: 129/255))
+                        Text("Deficit Kcal")
+                            .font(.system(size: 9, weight: .bold, design: .rounded))
+                            .foregroundStyle(Color(red: 16/255, green: 185/255, blue: 129/255))
+                    }
+                    .padding(.vertical, 6)
+                    .padding(.horizontal, 8)
+                    .background(Color(red: 16/255, green: 185/255, blue: 129/255).opacity(0.12))
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
+                }
+                .frame(maxWidth: .infinity, alignment: .center)
+            }
+            .padding(10)
+            .background(Color(red: 248/255, green: 249/255, blue: 250/255))
+            .clipShape(RoundedRectangle(cornerRadius: 12))
+            
+            // Timeline 7 Giorni Settimana Corrente (Lun-Dom)
+            VStack(alignment: .leading, spacing: 8) {
+                HStack {
+                    Text("PROGRESSO SETTIMANA CORRENTE (LUN – DOM)")
+                        .font(.system(size: 10, weight: .bold, design: .rounded))
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Text("Cumulato: -\(Int(stats.totalDeficit)) kcal")
+                        .font(.system(size: 10, weight: .bold, design: .rounded))
+                        .foregroundStyle(Color(red: 16/255, green: 185/255, blue: 129/255))
+                }
+                
+                HStack(spacing: 6) {
+                    ForEach(stats.dayStatuses, id: \.dateStr) { day in
+                        VStack(spacing: 4) {
+                            Text(day.shortName)
+                                .font(.system(size: 11, weight: day.isToday ? .heavy : .semibold, design: .rounded))
+                                .foregroundStyle(day.isToday ? Theme.coralTerracotta : (day.isTracked ? .primary : .secondary.opacity(0.6)))
+                            
+                            ZStack {
+                                Circle()
+                                    .fill(
+                                        day.isTracked
+                                        ? Color(red: 16/255, green: 185/255, blue: 129/255)
+                                        : (day.isToday ? Theme.coralTerracotta.opacity(0.3) : Color.black.opacity(0.06))
+                                    )
+                                    .frame(width: 24, height: 24)
+                                
+                                if day.isTracked {
+                                    Image(systemName: "checkmark")
+                                        .font(.system(size: 11, weight: .bold))
+                                        .foregroundStyle(.white)
+                                } else if day.isToday {
+                                    Circle()
+                                        .fill(Theme.coralTerracotta)
+                                        .frame(width: 8, height: 8)
+                                }
+                            }
+                            
+                            if day.isTracked && day.deficit > 0 {
+                                Text("-\(Int(day.deficit))")
+                                    .font(.system(size: 8, weight: .bold, design: .rounded))
+                                    .foregroundStyle(Color(red: 16/255, green: 185/255, blue: 129/255))
+                            } else {
+                                Text(day.isToday ? "Oggi" : "-")
+                                    .font(.system(size: 8, design: .rounded))
+                                    .foregroundStyle(.secondary.opacity(0.6))
+                            }
+                        }
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 6)
+                        .background(day.isToday ? Theme.coralTerracotta.opacity(0.06) : Color.clear)
+                        .clipShape(RoundedRectangle(cornerRadius: 10))
+                    }
+                }
+            }
+            
+            // Nota di sintesi ed educazione nutrizionale
+            Text("Deficit cumulato settimana (\(stats.weekLabel)): -\(Int(stats.totalDeficit)) kcal su \(stats.daysLoggedCount) \(stats.daysLoggedCount == 1 ? "giorno registrato" : "giorni registrati"). Mantenere 500-700 kcal/die assicura una lipolisi costante proteggendo i tessuti magri.")
                 .font(.system(size: 11, design: .rounded))
                 .foregroundStyle(.secondary)
-                .padding(.top, 4)
+                .padding(.top, 2)
         }
         .padding(18)
         .background(Color.white)

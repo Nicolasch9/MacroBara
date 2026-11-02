@@ -996,6 +996,14 @@ struct AddMealView: View {
         )
         entry.dailyLog = log
         log.meals.append(entry)
+        modelContext.insert(entry)
+        try? modelContext.save()
+        
+        let logDesc = FetchDescriptor<DailyLog>()
+        let allLogs = (try? modelContext.fetch(logDesc)) ?? []
+        let profileDesc = FetchDescriptor<UserProfile>()
+        let profile = (try? modelContext.fetch(profileDesc))?.first
+        WidgetSyncManager.shared.syncWidget(todayLog: log, profile: profile, allLogs: allLogs)
         
         lastSavedMealTitle = preset.title
         showingPostSaveAlert = true
@@ -1039,6 +1047,12 @@ struct AddMealView: View {
         log.meals.append(entry)
         modelContext.insert(entry)
         try? modelContext.save()
+        
+        let logDesc = FetchDescriptor<DailyLog>()
+        let allLogs = (try? modelContext.fetch(logDesc)) ?? []
+        let profileDesc = FetchDescriptor<UserProfile>()
+        let profile = (try? modelContext.fetch(profileDesc))?.first
+        WidgetSyncManager.shared.syncWidget(todayLog: log, profile: profile, allLogs: allLogs)
         
         lastSavedMealTitle = titleToSave
         showingPostSaveAlert = true

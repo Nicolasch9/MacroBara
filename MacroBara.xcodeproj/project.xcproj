@@ -40,6 +40,9 @@
           "kind": "script",
           "name": "Embed Widget Extension",
           "shell": "/bin/sh",
+          "outputs": [
+            "$(TARGET_BUILD_DIR)/$(WRAPPER_NAME)/PlugIns/MacroBaraWidgetExtension.appex"
+          ],
           "script": [
             "set -e",
             "PLUGINS_DIR=\"${TARGET_BUILD_DIR}/${WRAPPER_NAME}/PlugIns\"",
@@ -79,7 +82,7 @@
         "CODE_SIGN_ENTITLEMENTS": "MacroBara/MacroBara.entitlements",
         "CODE_SIGN_STYLE": "Automatic",
         "CURRENT_PROJECT_VERSION": "1",
-        "DEVELOPMENT_TEAM": "",
+        "DEVELOPMENT_TEAM": "N4B2W232Q9",
         "ENABLE_PREVIEWS": "YES",
         "ENABLE_USER_SCRIPT_SANDBOXING": "NO",
         "GENERATE_INFOPLIST_FILE": "YES",
@@ -126,7 +129,7 @@
         "CODE_SIGN_ENTITLEMENTS": "MacroBaraWidgetExtension/MacroBaraWidgetExtension.entitlements",
         "CODE_SIGN_STYLE": "Automatic",
         "CURRENT_PROJECT_VERSION": "1",
-        "DEVELOPMENT_TEAM": "",
+        "DEVELOPMENT_TEAM": "N4B2W232Q9",
         "GENERATE_INFOPLIST_FILE": "YES",
         "INFOPLIST_FILE": "MacroBaraWidgetConfig/Info.plist",
         "INFOPLIST_KEY_CFBundleDisplayName": "MacroBara Widget",
@@ -183,7 +186,7 @@
     "COPY_PHASE_STRIP": "NO",
     "DEBUG_INFORMATION_FORMAT[config=Debug]": "dwarf",
     "DEBUG_INFORMATION_FORMAT[config=Release]": "dwarf-with-dsym",
-    "DEVELOPMENT_TEAM": "",
+    "DEVELOPMENT_TEAM": "N4B2W232Q9",
     "ENABLE_NS_ASSERTIONS[config=Release]": "NO",
     "ENABLE_STRICT_OBJC_MSGSEND": "YES",
     "ENABLE_TESTABILITY[config=Debug]": "YES",

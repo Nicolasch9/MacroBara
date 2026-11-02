@@ -55,7 +55,11 @@ struct Provider: TimelineProvider {
 
     func getTimeline(in context: Context, completion: @escaping (Timeline<SimpleEntry>) -> ()) {
         let entry = SimpleEntry(date: Date(), data: WidgetDataModel.currentData())
-        let nextUpdate = Calendar.current.date(byAdding: .minute, value: 30, to: Date()) ?? Date()
+        let now = Date()
+        let calendar = Calendar.current
+        let inFifteenMinutes = calendar.date(byAdding: .minute, value: 15, to: now) ?? now.addingTimeInterval(900)
+        let nextMidnight = calendar.startOfDay(for: calendar.date(byAdding: .day, value: 1, to: now) ?? now)
+        let nextUpdate = min(inFifteenMinutes, nextMidnight)
         let timeline = Timeline(entries: [entry], policy: .after(nextUpdate))
         completion(timeline)
     }
@@ -99,49 +103,205 @@ struct WidgetDataModel: Codable {
     static var sampleData: WidgetDataModel {
         WidgetDataModel(
             greeting: greetingForCurrentHour(),
-            todayKcal: 1597,
+            todayKcal: 1523,
             targetKcal: 1600,
-            kcalRemaining: 3,
-            percentTarget: 99,
-            todayDeficitKcal: -553,
-            proteinG: 107.6,
+            kcalRemaining: 77,
+            percentTarget: 95,
+            todayDeficitKcal: -627,
+            proteinG: 130.3,
             targetProteinG: 130.0,
-            sugarsG: 29.0,
+            sugarsG: 39.7,
             maxSugarsG: 40.0,
-            steps: 4517,
+            steps: 4500,
             targetSteps: 7500,
-            totalDeficitKcal: -4102,
-            fatBurnedKg: 0.53,
+            totalDeficitKcal: -4729,
+            fatBurnedKg: 0.61,
             weekGrade: "A+",
             dayGrades: [
-                DayItem(date: "2026-10-26", day: "L", grade: "C", colorHex: "F59E0B", isToday: false, isLogged: true),
-                DayItem(date: "2026-10-27", day: "M", grade: "A+", colorHex: "10B981", isToday: false, isLogged: true),
-                DayItem(date: "2026-10-28", day: "M", grade: "A++", colorHex: "10B981", isToday: false, isLogged: true),
-                DayItem(date: "2026-10-29", day: "G", grade: "A+", colorHex: "10B981", isToday: false, isLogged: true),
-                DayItem(date: "2026-10-30", day: "V", grade: "A++", colorHex: "10B981", isToday: false, isLogged: true),
-                DayItem(date: "2026-10-31", day: "S", grade: "A+", colorHex: "10B981", isToday: false, isLogged: true),
-                DayItem(date: "2026-11-01", day: "D", grade: "A", colorHex: "10B981", isToday: true, isLogged: true)
+                DayItem(date: "2026-11-02", day: "L", grade: "A+", colorHex: "10B981", isToday: true, isLogged: true),
+                DayItem(date: "2026-11-03", day: "M", grade: "-", colorHex: "6B7280", isToday: false, isLogged: false),
+                DayItem(date: "2026-11-04", day: "M", grade: "-", colorHex: "6B7280", isToday: false, isLogged: false),
+                DayItem(date: "2026-11-05", day: "G", grade: "-", colorHex: "6B7280", isToday: false, isLogged: false),
+                DayItem(date: "2026-11-06", day: "V", grade: "-", colorHex: "6B7280", isToday: false, isLogged: false),
+                DayItem(date: "2026-11-07", day: "S", grade: "-", colorHex: "6B7280", isToday: false, isLogged: false),
+                DayItem(date: "2026-11-08", day: "D", grade: "-", colorHex: "6B7280", isToday: false, isLogged: false)
             ]
         )
     }
     
-    static func greetingForCurrentHour() -> String {
+    static func greetingForCurrentHour(name: String = "") -> String {
         let hour = Calendar.current.component(.hour, from: Date())
+        let prefix: String
         if hour < 12 {
-            return "Buongiorno, Marco"
+            prefix = "Buongiorno"
         } else if hour < 18 {
-            return "Buon pomeriggio, Marco"
+            prefix = "Buon pomeriggio"
         } else {
-            return "Buonasera, Marco"
+            prefix = "Buonasera"
         }
+        return name.isEmpty ? prefix : "\(prefix), \(name)"
     }
     
     static func currentData() -> WidgetDataModel {
+        // 1. Prova a leggere dai vari App Groups condivisi con l'App
+        let suiteNames = [
+            "group.com.macrobara.app",
+            "group.macrobara"
+        ]
+        
+        for suite in suiteNames {
+            if let defaults = UserDefaults(suiteName: suite),
+               let data = defaults.data(forKey: "macrobara_widget_data_v1"),
+               let parsed = parseJSON(data) {
+                return parsed
+            }
+            
+            if let container = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: suite) {
+                let fileURL = container.appendingPathComponent("widget_data.json")
+                if let data = try? Data(contentsOf: fileURL),
+                   let parsed = parseJSON(data) {
+                    return parsed
+                }
+            }
+        }
+        
+        // 2. Prova a leggere da standard UserDefaults
+        if let data = UserDefaults.standard.data(forKey: "macrobara_widget_data_v1"),
+           let parsed = parseJSON(data) {
+            return parsed
+        }
+        
+        // 3. Fallback dinamico basato sul calendario e su initial_history.json
+        if let dynamic = dynamicDataFromHistory() {
+            return dynamic
+        }
+        
         if let data = embeddedJSON.data(using: .utf8),
            let parsed = parseJSON(data) {
             return parsed
         }
         return sampleData
+    }
+    
+    static func dynamicDataFromHistory() -> WidgetDataModel? {
+        let fileData: Data?
+        if let url = Bundle.main.url(forResource: "initial_history", withExtension: "json") ??
+                     Bundle.main.url(forResource: "initial_history", withExtension: "json", subdirectory: "Resources"),
+           let d = try? Data(contentsOf: url) {
+            fileData = d
+        } else {
+            fileData = embeddedJSON.data(using: .utf8)
+        }
+        
+        guard let data = fileData,
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let daysDict = json["days"] as? [String: [String: Any]] else {
+            return nil
+        }
+        
+        let profileDict = json["profile"] as? [String: Any]
+        let targetKcal = (profileDict?["target_calories"] as? Int) ?? 1600
+        let targetProtein = (profileDict?["target_protein_g"] as? Double) ?? 130.0
+        let targetSugars = (profileDict?["target_sugar_max_g"] as? Double) ?? 40.0
+        let targetSteps = 7500
+        
+        let calendar = Calendar.current
+        let today = Date()
+        let todayFormatter = DateFormatter()
+        todayFormatter.dateFormat = "yyyy-MM-dd"
+        let todayStr = todayFormatter.string(from: today)
+        
+        var todayKcal = 0
+        var todayProtein = 0.0
+        var todaySugars = 0.0
+        var todaySteps = 0
+        var todayDeficit = -550
+        
+        if let todayDay = daysDict[todayStr] {
+            todayKcal = Int((todayDay["total_kcal"] as? Double) ?? 0.0)
+            todayProtein = (todayDay["total_protein"] as? Double) ?? 0.0
+            todaySugars = (todayDay["total_sugars"] as? Double) ?? 0.0
+            todaySteps = (todayDay["steps"] as? Int) ?? 0
+            let tdee = (todayDay["real_tdee"] as? Double) ?? 2150.0
+            todayDeficit = Int(Double(todayKcal) - tdee)
+        }
+        
+        // Calcola la striscia dei 7 giorni della settimana corrente (da Lunedì a Domenica)
+        let weekday = (calendar.component(.weekday, from: today) + 5) % 7 // 0 = Lun, ..., 6 = Dom
+        let monday = calendar.date(byAdding: .day, value: -weekday, to: calendar.startOfDay(for: today)) ?? today
+        
+        var dayItems: [DayItem] = []
+        let dayInitials = ["L", "M", "M", "G", "V", "S", "D"]
+        var totalDeficitSum: Double = 0.0
+        
+        for i in 0..<7 {
+            guard let date = calendar.date(byAdding: .day, value: i, to: monday) else { continue }
+            let dStr = todayFormatter.string(from: date)
+            let isDayToday = (dStr == todayStr)
+            let initial = dayInitials[i]
+            
+            if let dayData = daysDict[dStr] {
+                let kcal = (dayData["total_kcal"] as? Double) ?? 0.0
+                let sugars = (dayData["total_sugars"] as? Double) ?? 0.0
+                let pro = (dayData["total_protein"] as? Double) ?? 0.0
+                let tdee = (dayData["real_tdee"] as? Double) ?? 2150.0
+                let def = kcal - tdee
+                
+                let grade: String
+                if kcal >= 1400 && kcal <= 1700 && sugars <= 40 && pro >= 120 {
+                    grade = "A+"
+                } else if kcal <= 1750 && sugars <= 45 && pro >= 100 {
+                    grade = "A"
+                } else if kcal <= 1850 {
+                    grade = "B"
+                } else {
+                    grade = "C"
+                }
+                let colorHex = grade.contains("A") ? "10B981" : (grade.contains("B") ? "0284C7" : (grade.contains("C") ? "F59E0B" : "F43F5E"))
+                
+                dayItems.append(DayItem(
+                    date: dStr,
+                    day: initial,
+                    grade: grade,
+                    colorHex: colorHex,
+                    isToday: isDayToday,
+                    isLogged: true
+                ))
+                totalDeficitSum += def
+            } else {
+                dayItems.append(DayItem(
+                    date: dStr,
+                    day: initial,
+                    grade: isDayToday && todayKcal > 0 ? "A" : "-",
+                    colorHex: isDayToday && todayKcal > 0 ? "10B981" : "6B7280",
+                    isToday: isDayToday,
+                    isLogged: isDayToday && todayKcal > 0
+                ))
+            }
+        }
+        
+        let estFatLoss = max(0, -totalDeficitSum / 7700.0)
+        let remaining = max(0, targetKcal - todayKcal)
+        let percent = targetKcal > 0 ? Int((Double(todayKcal) / Double(targetKcal)) * 100) : 0
+        
+        return WidgetDataModel(
+            greeting: greetingForCurrentHour(),
+            todayKcal: todayKcal,
+            targetKcal: targetKcal,
+            kcalRemaining: remaining,
+            percentTarget: percent,
+            todayDeficitKcal: todayDeficit,
+            proteinG: todayProtein,
+            targetProteinG: targetProtein,
+            sugarsG: todaySugars,
+            maxSugarsG: targetSugars,
+            steps: todaySteps > 0 ? todaySteps : 4500,
+            targetSteps: targetSteps,
+            totalDeficitKcal: Int(totalDeficitSum),
+            fatBurnedKg: (estFatLoss * 100).rounded() / 100,
+            weekGrade: "A+",
+            dayGrades: dayItems
+        )
     }
     
     static func parseJSON(_ data: Data) -> WidgetDataModel? {
@@ -334,7 +494,7 @@ struct WidgetDataModel: Codable {
       "date": "2026-11-01",
       "day_initial": "D",
       "day_name": "Dom",
-      "is_today": true,
+      "is_today": false,
       "is_logged": true,
       "kcal": 1597,
       "deficit": -553,
@@ -343,17 +503,31 @@ struct WidgetDataModel: Codable {
       "sugars": 29.0,
       "protein": 107.6,
       "steps": 0
+    },
+    {
+      "date": "2026-11-02",
+      "day_initial": "L",
+      "day_name": "Lun",
+      "is_today": true,
+      "is_logged": true,
+      "kcal": 1523,
+      "deficit": -627,
+      "grade": "A+",
+      "score": 90,
+      "sugars": 39.7,
+      "protein": 130.3,
+      "steps": 0
     }
   ],
   "today": {
-    "date": "2026-11-01",
-    "weekday": "Domenica",
-    "grade": "A",
-    "score": 76,
-    "kcal": 1597.0,
-    "deficit": -553.0,
-    "sugars": 29.0,
-    "protein": 107.6,
+    "date": "2026-11-02",
+    "weekday": "Lunedì",
+    "grade": "A+",
+    "score": 90,
+    "kcal": 1523.0,
+    "deficit": -627.0,
+    "sugars": 39.7,
+    "protein": 130.3,
     "steps": 0
   }
 }
@@ -445,8 +619,9 @@ struct MacroBaraWidgetEntryView : View {
                                 .foregroundStyle(WidgetTheme.accentEmerald)
                         }
                         
+                        let loggedDays = max(1, d.dayGrades.filter { $0.isLogged }.count)
                         HStack(spacing: 2) {
-                            Text("Sett:")
+                            Text("Sett (\(loggedDays)g):")
                                 .font(.system(size: 8.5, weight: .medium, design: .rounded))
                                 .foregroundStyle(.white.opacity(0.6))
                             Text("\(d.totalDeficitKcal) kcal")

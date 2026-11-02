@@ -40,6 +40,7 @@ struct ProfileView: View {
     
     @State private var showingSavedAlert: Bool = false
     @State private var showingResetConfirmation: Bool = false
+    @State private var showingSyncAlert: Bool = false
     
     private var currentProfile: UserProfile {
         profiles.first ?? UserProfile()
@@ -282,7 +283,7 @@ struct ProfileView: View {
                     }
                 }
                 
-                // 5. Intelligenza Artificiale Gemini
+                // Motore IA Gemini
                 Section("Motore IA Gemini") {
                     SecureField("Chiave API Google AI Studio", text: Bindable(gemini).apiKey)
                         .font(.system(.body, design: .monospaced))
@@ -294,7 +295,24 @@ struct ProfileView: View {
                     }
                 }
                 
-                // 5. Salva & Azioni
+                // Sincronizzazione Dati & Storico
+                Section("Sincronizzazione Dati & Storico") {
+                    Button {
+                        DataImporter.shared.cleanupAndImport(modelContext: modelContext)
+                        showingSyncAlert = true
+                    } label: {
+                        HStack {
+                            Image(systemName: "arrow.clockwise.circle.fill")
+                                .foregroundStyle(Theme.coralTerracotta)
+                            Text("Ricarica Storico da history.json")
+                                .font(.system(.body, design: .rounded).weight(.semibold))
+                                .foregroundStyle(.primary)
+                            Spacer()
+                        }
+                    }
+                }
+                
+                // Salva & Azioni
                 Section {
                     Button {
                         saveProfile()
@@ -336,6 +354,11 @@ struct ProfileView: View {
                 Button("OK", role: .cancel) {}
             } message: {
                 Text("Tutti i parametri biometrici, calorie e macro target sono stati salvati.")
+            }
+            .alert("Storico Sincronizzato! ✅", isPresented: $showingSyncAlert) {
+                Button("OK", role: .cancel) {}
+            } message: {
+                Text("Tutti i dati e i pasti presenti nel file history.json sono stati ricaricati e aggiornati con successo.")
             }
             .fileImporter(
                 isPresented: $showingFolderPicker,

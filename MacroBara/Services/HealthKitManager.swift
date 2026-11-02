@@ -74,14 +74,9 @@ final class HealthKitManager {
             }
         }
         
-        // 3. Calorie Riposo
-        if let basalType = HKQuantityType.quantityType(forIdentifier: .basalEnergyBurned) {
-            let basalKcal = await fetchCumulativeSum(for: basalType, unit: .kilocalorie(), predicate: predicate)
-            if basalKcal > 0 {
-                await MainActor.run {
-                    self.restingEnergyBurnedKcal = (basalKcal * 10).rounded() / 10
-                }
-            }
+        // 3. Calorie Riposo: fissate a 1750.0 kcal (BMR calibrato)
+        await MainActor.run {
+            self.restingEnergyBurnedKcal = 1750.0
         }
     }
     
